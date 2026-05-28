@@ -10,6 +10,26 @@ The Streamlit `Ingest` tab runs ChEMBL ingestion, PubChem ingestion, and UniChem
 
 Run scripts inside the `frontend` container so they use the same dependencies and network as the app.
 
+If HTTPS requests fail on a corporate network with `certificate verify failed: self-signed certificate in certificate chain`,
+export the company root CA as a PEM file and point ingestion at it:
+
+```powershell
+Copy-Item .\company-root-ca.pem .\certs\company-root-ca.pem
+```
+
+Set the following in `.env`:
+
+```text
+HERG_CA_CERTS_DIR=./certs
+HERG_CA_BUNDLE=/certs/company-root-ca.pem
+```
+
+Rebuild the frontend container after changing `.env` or `app/Dockerfile`:
+
+```powershell
+docker compose up -d --build frontend
+```
+
 ChEMBL hERG IC50 ingestion:
 
 ```powershell

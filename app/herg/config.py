@@ -33,6 +33,7 @@ class HttpConfig:
     request_timeout_seconds: int = 45
     http_retries: int = 4
     user_agent: str = "herg-ingest/1.0"
+    ca_bundle_path: str | None = None
 
 
 @dataclass(frozen=True)

@@ -27,8 +27,11 @@ services:
       DB_NAME: ${POSTGRES_DB:-herg}
       DB_USER: ${POSTGRES_USER:-herg_user}
       DB_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      HERG_CA_BUNDLE: ${HERG_CA_BUNDLE:-}
     ports:
       - "127.0.0.1:${UI_PORT:-8501}:8501"
+    volumes:
+      - ${HERG_CA_CERTS_DIR:-./certs}:/certs:ro
     depends_on:
       db:
         condition: service_healthy
