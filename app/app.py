@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from herg.ingest_all import (
+    IngestAllConfig,
     IngestProgress,
     IngestStepResult,
     SourceIngestionProgress,
@@ -122,6 +123,22 @@ ingest_tab, results_tab, dashboard_tab = st.tabs(["Ingest", "Browse Results", "D
 
 with ingest_tab:
     st.subheader("Ingest")
+    use_demo_limit = st.checkbox(
+        "Limit records for demo",
+        value=False,
+        help="Apply a maximum record count to each ingestion source and each enrichment namespace.",
+    )
+    demo_record_limit = None
+    if use_demo_limit:
+        demo_record_limit = st.number_input(
+            "Max records per ingestion/enrichment step",
+            min_value=1,
+            max_value=1_000_000,
+            value=100,
+            step=100,
+        )
+        st.caption("The limit applies separately to ChEMBL, PubChem, and each UniChem namespace.")
+
     if st.button("Ingest and Enrich All", type="primary", key="ingest_all_btn"):
         progress_lines: list[str] = []
         progress_placeholder = st.empty()
@@ -163,6 +180,9 @@ with ingest_tab:
         try:
             with st.spinner("Running ingestion and enrichment..."), redirect_stdout(stdout_buffer):
                 ingest_results = run_ingest_and_enrich_all(
+                    config=IngestAllConfig(
+                        max_records=int(demo_record_limit) if demo_record_limit else None,
+                    ),
                     progress_logger=log_progress,
                     progress_callback=update_progress,
                     source_progress_callback=update_source_progress,

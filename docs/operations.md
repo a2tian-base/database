@@ -5,6 +5,7 @@ Use this file for commands that are useful during maintenance but too detailed f
 ## Frontend Ingestion
 
 The Streamlit `Ingest` tab runs ChEMBL ingestion, PubChem ingestion, and UniChem identifier enrichment in sequence.
+Enable `Limit records for demo` to cap each ingestion source and each UniChem namespace during demo runs.
 
 ## Source Ingestion
 
