@@ -1,234 +1,31 @@
+import io
 import math
-import uuid
-from typing import Dict, List, Optional
+from contextlib import redirect_stdout
 
 import pandas as pd
 import streamlit as st
-from psycopg.errors import UniqueViolation
 
-from herg.db import get_conn, upsert_compound, upsert_ic50_result, upsert_source_record
+from herg.ingest_all import (
+    IngestProgress,
+    IngestStepResult,
+    SourceIngestionProgress,
+    run_ingest_and_enrich_all,
+)
 from herg.read_db import (
-    fetch_compounds,
     fetch_dashboard_data,
     fetch_dashboard_metrics,
     fetch_results,
     fetch_results_count,
-    resolve_compound_id,
 )
-from herg.models import CompoundInput, Ic50Input, SourceRecordInput
-from herg.normalize import (
-    build_identifier_inputs,
-    build_name_inputs,
-    clean_text,
-    normalize_ic50_unit,
-    normalize_qualifier,
-    parse_optional_positive_int,
-    parse_pipe_or_comma_names,
-)
+
+
+SOURCE_DISPLAY_NAMES = {
+    "chembl": "ChEMBL",
+    "pubchem": "PubChem",
+}
 
 
 st.set_page_config(page_title="hERG IC50 Database", layout="wide")
-
-
-def build_compound_label(compound: Dict) -> str:
-    compound_id = compound.get("compound_id")
-    preferred_name = clean_text(compound.get("preferred_name"))
-    chembl_id = clean_text(compound.get("chembl_id"))
-    a_number = clean_text(compound.get("a_number"))
-    unii = clean_text(compound.get("unii"))
-    pubchem_cid = compound.get("pubchem_cid")
-    standard_inchikey = clean_text(compound.get("standard_inchikey"))
-
-    if preferred_name:
-        label = preferred_name
-    elif chembl_id:
-        label = f"ChEMBL:{chembl_id}"
-    elif a_number:
-        label = f"A-number:{a_number}"
-    elif unii:
-        label = f"UNII:{unii}"
-    elif pubchem_cid:
-        label = f"PubChem:{pubchem_cid}"
-    else:
-        label = f"compound_id:{compound_id}"
-
-    if standard_inchikey:
-        label = f"{label} | InChIKey:{standard_inchikey}"
-
-    return f"{label} (id={compound_id})"
-
-
-def import_compounds_csv(df: pd.DataFrame) -> Dict:
-    normalized = df.copy()
-    normalized.columns = [str(col).strip().lower() for col in normalized.columns]
-
-    expected_columns = {
-        "a_number",
-        "unii",
-        "pubchem_cid",
-        "chembl_id",
-        "standard_inchikey",
-        "standard_inchi",
-        "canonical_smiles",
-        "preferred_name",
-        "common_names",
-    }
-
-    unknown = [col for col in normalized.columns if col not in expected_columns]
-    if unknown:
-        raise ValueError(f"Unexpected columns: {', '.join(unknown)}")
-    if normalized.empty:
-        raise ValueError("CSV has no data rows.")
-
-    records = normalized.to_dict(orient="records")
-    errors: List[Dict] = []
-    imported = 0
-
-    with get_conn() as conn, conn.cursor() as cur:
-        for row_index, record in enumerate(records, start=2):
-            cur.execute("SAVEPOINT csv_row")
-            try:
-                a_number = clean_text(record.get("a_number"))
-                unii = clean_text(record.get("unii"))
-                chembl_id = clean_text(record.get("chembl_id"))
-                standard_inchikey = clean_text(record.get("standard_inchikey"))
-                standard_inchi = clean_text(record.get("standard_inchi"))
-                canonical_smiles = clean_text(record.get("canonical_smiles"))
-                preferred_name = clean_text(record.get("preferred_name"))
-                aliases = parse_pipe_or_comma_names(record.get("common_names"))
-
-                pubchem_cid_value: Optional[int] = None
-                pubchem_text = clean_text(record.get("pubchem_cid"))
-                if pubchem_text:
-                    pubchem_cid_value = parse_optional_positive_int(pubchem_text)
-
-                identifier_values = {
-                    "a_number": a_number,
-                    "unii": unii,
-                    "pubchem_cid": str(pubchem_cid_value) if pubchem_cid_value is not None else "",
-                    "chembl_id": chembl_id,
-                }
-                identifiers = build_identifier_inputs(identifier_values)
-                names = build_name_inputs(preferred_name=preferred_name, aliases=aliases)
-
-                if not identifiers and not standard_inchikey:
-                    raise ValueError("No identifier or Standard InChIKey provided.")
-
-                compound_input = CompoundInput(
-                    canonical_smiles=canonical_smiles,
-                    standard_inchi=standard_inchi,
-                    standard_inchikey=standard_inchikey,
-                    identifiers=identifiers,
-                    names=names,
-                )
-
-                upsert_compound(cur, compound_input)
-                cur.execute("RELEASE SAVEPOINT csv_row")
-                imported += 1
-            except Exception as exc:
-                cur.execute("ROLLBACK TO SAVEPOINT csv_row")
-                cur.execute("RELEASE SAVEPOINT csv_row")
-                errors.append({"row": row_index, "error": str(exc)})
-
-    return {"total": len(records), "imported": imported, "failed": len(errors), "errors": errors}
-
-
-def import_ic50_csv(df: pd.DataFrame) -> Dict:
-    normalized = df.copy()
-    normalized.columns = [str(col).strip().lower() for col in normalized.columns]
-
-    required_columns = {
-        "id_type",
-        "id_value",
-        "ic50_value",
-        "ic50_unit",
-        "qualifier",
-        "source_name",
-        "source_record_key",
-        "source_release",
-        "source_url",
-    }
-    missing = [col for col in required_columns if col not in normalized.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
-
-    unknown = [col for col in normalized.columns if col not in required_columns]
-    if unknown:
-        raise ValueError(f"Unexpected columns: {', '.join(unknown)}")
-    if normalized.empty:
-        raise ValueError("CSV has no data rows.")
-
-    records = normalized.to_dict(orient="records")
-    errors: List[Dict] = []
-    imported = 0
-
-    with get_conn() as conn, conn.cursor() as cur:
-        for row_index, record in enumerate(records, start=2):
-            cur.execute("SAVEPOINT csv_row")
-            try:
-                id_type = clean_text(record.get("id_type")).lower()
-                id_value = clean_text(record.get("id_value"))
-                if not id_type:
-                    raise ValueError("id_type is required.")
-                if not id_value:
-                    raise ValueError("id_value is required.")
-
-                compound_id = resolve_compound_id(cur=cur, id_type=id_type, id_value=id_value)
-                if compound_id is None:
-                    raise ValueError(f"No compound found for {id_type}='{id_value}'.")
-
-                ic50_value_text = clean_text(record.get("ic50_value"))
-                try:
-                    ic50_value = float(ic50_value_text)
-                except ValueError as exc:
-                    raise ValueError(f"Invalid ic50_value '{ic50_value_text}'.") from exc
-                if ic50_value <= 0:
-                    raise ValueError("ic50_value must be > 0.")
-
-                ic50_unit = normalize_ic50_unit(record.get("ic50_unit"))
-                qualifier = normalize_qualifier(record.get("qualifier"))
-
-                source_name = clean_text(record.get("source_name"))
-                source_record_key = clean_text(record.get("source_record_key"))
-                source_release = clean_text(record.get("source_release"))
-                source_url = clean_text(record.get("source_url"))
-
-                if not source_name:
-                    raise ValueError("source_name is required.")
-                if not source_record_key:
-                    raise ValueError("source_record_key is required.")
-
-                source_input = SourceRecordInput(
-                    source_name=source_name,
-                    source_record_key=source_record_key,
-                    record_type="csv_import",
-                    source_release=source_release,
-                    source_url=source_url,
-                )
-
-                source_record_id = upsert_source_record(cur, source_input)
-
-                measurement = Ic50Input(
-                    ic50_value=ic50_value,
-                    ic50_unit=ic50_unit,
-                    qualifier=qualifier,
-                    endpoint="IC50",
-                )
-
-                upsert_ic50_result(
-                    cur=cur,
-                    compound_id=compound_id,
-                    source_record_id=source_record_id,
-                    measurement=measurement,
-                )
-                cur.execute("RELEASE SAVEPOINT csv_row")
-                imported += 1
-            except Exception as exc:
-                cur.execute("ROLLBACK TO SAVEPOINT csv_row")
-                cur.execute("RELEASE SAVEPOINT csv_row")
-                errors.append({"row": row_index, "error": str(exc)})
-
-    return {"total": len(records), "imported": imported, "failed": len(errors), "errors": errors}
 
 
 def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
@@ -254,147 +51,152 @@ def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
     )
 
 
-def render_import_summary(entity: str, summary: Dict) -> None:
-    st.info(
-        f"{entity}: imported {summary['imported']} of {summary['total']} rows "
-        f"({summary['failed']} failed)."
-    )
-    if summary["errors"]:
-        st.warning("Some rows failed. See details below.")
-        st.dataframe(pd.DataFrame(summary["errors"]), use_container_width=True, hide_index=True)
+def _summary_value(stats: dict[str, object], key: str) -> object:
+    value = stats.get(key)
+    return "" if value is None else value
+
+
+def build_ingest_summary(results: list[IngestStepResult]) -> pd.DataFrame:
+    rows = []
+    for result in results:
+        stats = result.stats
+        rows.append(
+            {
+                "step": result.name,
+                "type": result.kind,
+                "status": "complete" if result.success else "needs review",
+                "candidates": _summary_value(stats, "candidate_rows_found"),
+                "processed": _summary_value(stats, "processed"),
+                "stored": _summary_value(stats, "stored"),
+                "attached": _summary_value(stats, "attached"),
+                "already_present": _summary_value(stats, "already_present"),
+                "unmatched": _summary_value(stats, "unmatched"),
+                "conflicts": _summary_value(stats, "conflict"),
+                "skipped": _summary_value(stats, "skipped_invalid"),
+                "failed": _summary_value(stats, "failed"),
+                "duration_seconds": _summary_value(stats, "duration_seconds"),
+                "error": result.error,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_source_progress_summary(source_progress: dict[str, dict[str, object]]) -> pd.DataFrame:
+    rows = []
+    for source_name, display_name in SOURCE_DISPLAY_NAMES.items():
+        stats = source_progress.get(source_name, {})
+        rows.append(
+            {
+                "source": display_name,
+                "phase": stats.get("phase", "waiting"),
+                "processed": stats.get("processed", 0),
+                "ingested": stats.get("stored", 0),
+                "skipped": stats.get("skipped_invalid", 0),
+                "failed": stats.get("failed", 0),
+                "warnings": stats.get("warnings", 0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_ingest_results(results: list[IngestStepResult], run_log: str) -> None:
+    if not results:
+        return
+
+    if all(result.success for result in results):
+        st.success("Ingest and enrichment completed.")
+    else:
+        st.warning("Ingest and enrichment completed with issues.")
+
+    st.dataframe(build_ingest_summary(results), use_container_width=True, hide_index=True)
+
+    if run_log.strip():
+        with st.expander("Run log"):
+            st.code(run_log.strip(), language="text")
 
 
 st.title("hERG IC50 Database")
-st.write("Use this interface to manually upload results and browse the data.")
+st.write("Run ingestion, browse loaded hERG IC50 results, and explore database metrics.")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Add Compound", "Add IC50 Result", "Upload CSV", "Browse Results", "Dashboard"]
-)
+ingest_tab, results_tab, dashboard_tab = st.tabs(["Ingest", "Browse Results", "Dashboard"])
 
-with tab1:
-    st.subheader("Register Compound")
-    with st.form("compound_form", clear_on_submit=True):
-        a_number = st.text_input("A-number (optional)", max_chars=100)
-        unii = st.text_input("UNII (optional)", max_chars=100)
-        pubchem_cid_text = st.text_input("PubChem CID (optional)", max_chars=30)
-        chembl_id = st.text_input("ChEMBL ID (optional)", max_chars=100)
-        standard_inchikey = st.text_input("Standard InChIKey (optional)", max_chars=200)
-        standard_inchi = st.text_area("Standard InChI (optional)", height=80)
-        canonical_smiles = st.text_area("Canonical SMILES (optional)", height=80)
-        preferred_name = st.text_input("Preferred name (optional)", max_chars=200)
-        aliases_text = st.text_input("Aliases (pipe or comma-separated, optional)")
-        submitted = st.form_submit_button("Save Compound")
+with ingest_tab:
+    st.subheader("Ingest")
+    if st.button("Ingest and Enrich All", type="primary", key="ingest_all_btn"):
+        progress_lines: list[str] = []
+        progress_placeholder = st.empty()
+        progress_bar = st.progress(0, text="Starting ingestion...")
+        progress_state = {"percent": 0}
+        source_progress_state: dict[str, dict[str, object]] = {}
+        source_progress_placeholder = st.empty()
+        source_progress_placeholder.dataframe(
+            build_source_progress_summary(source_progress_state),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    if submitted:
-        a_number_value = clean_text(a_number)
-        unii_value = clean_text(unii)
-        chembl_value = clean_text(chembl_id)
-        standard_inchikey_value = clean_text(standard_inchikey)
-        standard_inchi_value = clean_text(standard_inchi)
-        canonical_smiles_value = clean_text(canonical_smiles)
-        preferred_name_value = clean_text(preferred_name)
-        aliases_value = parse_pipe_or_comma_names(aliases_text)
+        def log_progress(message: str) -> None:
+            progress_lines.append(message)
+            progress_placeholder.info(message)
 
-        pubchem_cid_value: Optional[int] = None
-        input_error = False
-        pubchem_text = clean_text(pubchem_cid_text)
-        if pubchem_text:
-            try:
-                pubchem_cid_value = parse_optional_positive_int(pubchem_text)
-            except ValueError:
-                st.error("`pubchem_cid` must be a positive integer.")
-                input_error = True
+        def update_progress(progress: IngestProgress) -> None:
+            percent = int(progress.overall_fraction * 100)
+            progress_state["percent"] = percent
+            progress_bar.progress(percent, text=f"{percent}% - {progress.message}")
 
-        identifier_values = {
-            "a_number": a_number_value,
-            "unii": unii_value,
-            "pubchem_cid": str(pubchem_cid_value) if pubchem_cid_value is not None else "",
-            "chembl_id": chembl_value,
-        }
-        identifiers = build_identifier_inputs(identifier_values)
-        names = build_name_inputs(preferred_name=preferred_name_value, aliases=aliases_value)
-
-        if not input_error and not identifiers and not standard_inchikey_value:
-            st.error("Provide at least one identifier or a Standard InChIKey.")
-        elif not input_error:
-            compound_input = CompoundInput(
-                canonical_smiles=canonical_smiles_value,
-                standard_inchi=standard_inchi_value,
-                standard_inchikey=standard_inchikey_value,
-                identifiers=identifiers,
-                names=names,
+        def update_source_progress(progress: SourceIngestionProgress) -> None:
+            source_progress_state[progress.source_name] = {
+                "phase": progress.phase,
+                "processed": progress.processed,
+                "stored": progress.stored,
+                "skipped_invalid": progress.skipped_invalid,
+                "failed": progress.failed,
+                "warnings": progress.warnings,
+            }
+            source_progress_placeholder.dataframe(
+                build_source_progress_summary(source_progress_state),
+                use_container_width=True,
+                hide_index=True,
             )
 
-            try:
-                with get_conn() as conn, conn.cursor() as cur:
-                    compound_id = upsert_compound(cur, compound_input)
-                st.success(f"Compound saved/matched as compound_id={compound_id}.")
-            except UniqueViolation:
-                st.error("Identifier conflict found while saving compound.")
-            except Exception as exc:
-                st.error(f"Failed to save compound: {exc}")
-
-with tab2:
-    st.subheader("Add IC50 Result")
-    compounds = fetch_compounds()
-    if not compounds:
-        st.info("No compounds found yet. Add at least one compound first.")
-    else:
-        compound_options = {build_compound_label(c): c["compound_id"] for c in compounds}
-        with st.form("result_form", clear_on_submit=True):
-            compound_label = st.selectbox("Compound", options=list(compound_options.keys()))
-            ic50_value = st.number_input("IC50 Value", min_value=0.000001, value=100.0, step=1.0, format="%.6f")
-            ic50_unit = st.selectbox("IC50 Unit", options=["pM", "nM", "uM", "mM"], index=1)
-            qualifier = st.selectbox("Qualifier", options=["=", "<", ">"], index=0)
-            source_name = st.text_input("Source name", value="manual")
-            source_record_key = st.text_input("Source record key (optional)")
-            source_release = st.text_input("Source release (optional)")
-            source_url = st.text_input("Source URL (optional)")
-            submitted_result = st.form_submit_button("Save IC50 Result")
-
-        if submitted_result:
-            try:
-                source_name_value = clean_text(source_name)
-                if not source_name_value:
-                    raise ValueError("source_name is required.")
-
-                source_record_key_value = clean_text(source_record_key)
-                if not source_record_key_value:
-                    source_record_key_value = f"manual:{uuid.uuid4()}"
-
-                source_input = SourceRecordInput(
-                    source_name=source_name_value,
-                    source_record_key=source_record_key_value,
-                    record_type="manual_entry",
-                    source_release=clean_text(source_release),
-                    source_url=clean_text(source_url),
+        stdout_buffer = io.StringIO()
+        try:
+            with st.spinner("Running ingestion and enrichment..."), redirect_stdout(stdout_buffer):
+                ingest_results = run_ingest_and_enrich_all(
+                    progress_logger=log_progress,
+                    progress_callback=update_progress,
+                    source_progress_callback=update_source_progress,
                 )
-
-                measurement = Ic50Input(
-                    ic50_value=float(ic50_value),
-                    ic50_unit=normalize_ic50_unit(ic50_unit),
-                    qualifier=normalize_qualifier(qualifier),
-                    endpoint="IC50",
+        except Exception as exc:
+            progress_bar.progress(
+                progress_state["percent"],
+                text=f"{progress_state['percent']}% - Ingestion stopped with an error.",
+            )
+            ingest_results = [
+                IngestStepResult(
+                    name="Ingest and Enrich All",
+                    kind="workflow",
+                    success=False,
+                    stats={},
+                    error=str(exc),
                 )
+            ]
 
-                with get_conn() as conn, conn.cursor() as cur:
-                    source_record_id = upsert_source_record(cur, source_input)
-                    result = upsert_ic50_result(
-                        cur,
-                        compound_options[compound_label],
-                        source_record_id,
-                        measurement,
-                    )
+        stdout_log = stdout_buffer.getvalue().strip()
+        run_log = "\n".join(progress_lines)
+        if stdout_log:
+            run_log = f"{run_log}\n{stdout_log}" if run_log else stdout_log
 
-                st.success(
-                    f"Result #{result['result_id']} saved. "
-                    f"ic50_um={result['ic50_um']}, pIC50={result['pic50']} "
-                    f"(qualifier {result['pic50_qualifier']})."
-                )
-            except Exception as exc:
-                st.error(f"Failed to save IC50 result: {exc}")
+        st.session_state["ingest_results"] = ingest_results
+        st.session_state["ingest_run_log"] = run_log
+        progress_placeholder.empty()
 
-with tab4:
+    render_ingest_results(
+        st.session_state.get("ingest_results", []),
+        st.session_state.get("ingest_run_log", ""),
+    )
+
+with results_tab:
     st.subheader("Browse Results")
     limit = st.slider("Rows to preview", min_value=10, max_value=1000, value=100, step=10)
     try:
@@ -432,70 +234,7 @@ with tab4:
     except Exception as exc:
         st.error(f"Failed to load results: {exc}")
 
-with tab3:
-    st.subheader("Upload CSV")
-    st.write("Bulk upload compounds and IC50 results directly from CSV files.")
-
-    compounds_template = (
-        "a_number,unii,pubchem_cid,chembl_id,standard_inchikey,standard_inchi,canonical_smiles,preferred_name,common_names\n"
-        "A-0001,,702,CHEMBL545,LFQSCWFLJHTTHZ-UHFFFAOYSA-N,,CCO,ethanol,ethyl alcohol|alcohol\n"
-    )
-    ic50_template = (
-        "id_type,id_value,ic50_value,ic50_unit,qualifier,source_name,source_record_key,source_release,source_url\n"
-        "chembl_id,CHEMBL545,125,nM,=,manual,manual:001,,\n"
-        "pubchem_cid,1983,0.85,uM,<,literature,paper:smith-2024-table2,,\n"
-    )
-
-    st.download_button(
-        label="Download compounds CSV template",
-        data=compounds_template.encode("utf-8"),
-        file_name="compounds_template.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        label="Download IC50 CSV template",
-        data=ic50_template.encode("utf-8"),
-        file_name="ic50_template.csv",
-        mime="text/csv",
-    )
-
-    st.markdown("### Import compounds CSV")
-    st.caption(
-        "Expected columns: a_number, unii, pubchem_cid, chembl_id, standard_inchikey, "
-        "standard_inchi, canonical_smiles, preferred_name, common_names"
-    )
-    uploaded_compounds = st.file_uploader("Choose compounds CSV", type=["csv"], key="upload_compounds_csv")
-    if st.button("Import compounds CSV", key="import_compounds_btn"):
-        if uploaded_compounds is None:
-            st.error("Please choose a compounds CSV file first.")
-        else:
-            try:
-                uploaded_compounds.seek(0)
-                compounds_df = pd.read_csv(uploaded_compounds)
-                summary = import_compounds_csv(compounds_df)
-                render_import_summary("Compounds", summary)
-            except Exception as exc:
-                st.error(f"Compounds CSV import failed: {exc}")
-
-    st.markdown("### Import IC50 CSV")
-    st.caption(
-        "Expected columns: id_type, id_value, ic50_value, ic50_unit, qualifier, "
-        "source_name, source_record_key, source_release, source_url"
-    )
-    uploaded_ic50 = st.file_uploader("Choose IC50 CSV", type=["csv"], key="upload_ic50_csv")
-    if st.button("Import IC50 CSV", key="import_ic50_btn"):
-        if uploaded_ic50 is None:
-            st.error("Please choose an IC50 CSV file first.")
-        else:
-            try:
-                uploaded_ic50.seek(0)
-                ic50_df = pd.read_csv(uploaded_ic50)
-                summary = import_ic50_csv(ic50_df)
-                render_import_summary("IC50 results", summary)
-            except Exception as exc:
-                st.error(f"IC50 CSV import failed: {exc}")
-
-with tab5:
+with dashboard_tab:
     st.subheader("Data Dashboard")
     st.write("Summary metrics and distribution views for loaded IC50 records.")
 

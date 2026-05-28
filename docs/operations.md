@@ -2,27 +2,9 @@
 
 Use this file for commands that are useful during maintenance but too detailed for the README.
 
-## CSV Uploads
+## Frontend Ingestion
 
-The Streamlit `Upload CSV` tab can import compounds and IC50 results. It also provides downloadable templates.
-
-Compound CSV columns:
-
-```csv
-a_number,unii,pubchem_cid,chembl_id,standard_inchikey,standard_inchi,canonical_smiles,preferred_name,common_names
-```
-
-IC50 CSV columns:
-
-```csv
-id_type,id_value,ic50_value,ic50_unit,qualifier,source_name,source_record_key,source_release,source_url
-```
-
-Notes:
-- `common_names` can be pipe-separated or comma-separated.
-- `id_type` should match an identifier namespace such as `chembl_id`, `pubchem_cid`, `unii`, `a_number`, or `standard_inchikey`.
-- `ic50_unit` must be `pM`, `nM`, `uM`, or `mM`.
-- `qualifier` must be `=`, `<`, or `>`.
+The Streamlit `Ingest` tab runs ChEMBL ingestion, PubChem ingestion, and UniChem identifier enrichment in sequence.
 
 ## Source Ingestion
 

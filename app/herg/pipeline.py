@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Iterable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from .config import DbConfig, RunConfig
 from .db import (
@@ -17,6 +17,7 @@ from .pipeline_common import JsonlLogger, duration_seconds, log_jsonl, now_utc_i
 
 
 DEFAULT_ENRICH_BATCH_SIZE = 250
+PROGRESS_RECORD_INTERVAL = 100
 
 
 def log(message: str) -> None:
@@ -49,6 +50,20 @@ class IngestionStats:
     duration_seconds: float = 0.0
 
 
+@dataclass(frozen=True)
+class IngestionProgress:
+    source_name: str
+    phase: str
+    processed: int
+    stored: int
+    skipped_invalid: int
+    failed: int
+    warnings: int
+
+
+ProgressCallback = Callable[[IngestionProgress], None]
+
+
 def _validate_staged_record(record: StagedRecord) -> None:
     if not clean_text(record.external_key):
         raise ValueError("Missing external_key.")
@@ -76,7 +91,37 @@ def _enrich_batch_size(adapter: SourceAdapter) -> int:
     return int(getattr(adapter, "enrich_batch_size", DEFAULT_ENRICH_BATCH_SIZE))
 
 
-def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunConfig) -> IngestionStats:
+def _emit_progress(
+    callback: ProgressCallback | None,
+    adapter: SourceAdapter,
+    stats: IngestionStats,
+    phase: str,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        IngestionProgress(
+            source_name=adapter.source_name,
+            phase=phase,
+            processed=stats.processed,
+            stored=stats.stored,
+            skipped_invalid=stats.skipped_invalid,
+            failed=stats.failed,
+            warnings=stats.warnings,
+        )
+    )
+
+
+def _should_emit_count(count: int) -> bool:
+    return count == 1 or count % PROGRESS_RECORD_INTERVAL == 0
+
+
+def run_pipeline(
+    adapter: SourceAdapter,
+    db_config: DbConfig,
+    run_config: RunConfig,
+    progress_callback: ProgressCallback | None = None,
+) -> IngestionStats:
     stats = IngestionStats()
     stats.started_at = now_utc_iso()
     error_logger = JsonlLogger(run_config.errors_path)
@@ -88,6 +133,7 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
 
     def process_rows(rows: list[dict], cur) -> None:
         nonlocal processed_since_commit
+        _emit_progress(progress_callback, adapter, stats, "enriching")
         enriched_rows = adapter.enrich_batch(rows)
         if len(enriched_rows) != len(rows):
             stats.warnings += 1
@@ -99,18 +145,24 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
             except ValueError as exc:
                 stats.skipped_invalid += 1
                 log_jsonl(error_logger, adapter.source_name, raw_external_key, str(exc), row)
+                if _should_emit_count(stats.skipped_invalid):
+                    _emit_progress(progress_callback, adapter, stats, "storing")
                 if run_config.fail_fast:
                     raise
                 continue
             except Exception as exc:
                 stats.failed += 1
                 log_jsonl(error_logger, adapter.source_name, raw_external_key, str(exc), row)
+                if _should_emit_count(stats.failed):
+                    _emit_progress(progress_callback, adapter, stats, "storing")
                 if run_config.fail_fast:
                     raise
                 continue
 
             if run_config.dry_run:
                 stats.stored += 1
+                if _should_emit_count(stats.stored):
+                    _emit_progress(progress_callback, adapter, stats, "validating")
                 continue
 
             cur.execute("SAVEPOINT ingest_row")
@@ -121,11 +173,15 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
                 cur.execute("RELEASE SAVEPOINT ingest_row")
                 stats.stored += 1
                 processed_since_commit += 1
+                if _should_emit_count(stats.stored):
+                    _emit_progress(progress_callback, adapter, stats, "storing")
             except Exception as exc:
                 cur.execute("ROLLBACK TO SAVEPOINT ingest_row")
                 cur.execute("RELEASE SAVEPOINT ingest_row")
                 stats.failed += 1
                 log_jsonl(error_logger, adapter.source_name, staged.external_key, str(exc), asdict(staged))
+                if _should_emit_count(stats.failed):
+                    _emit_progress(progress_callback, adapter, stats, "storing")
                 if run_config.fail_fast:
                     raise
 
@@ -134,6 +190,7 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
                 processed_since_commit = 0
 
     try:
+        _emit_progress(progress_callback, adapter, stats, "starting")
         with get_conn(
             host=db_config.host,
             port=db_config.port,
@@ -148,6 +205,8 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
                         break
                     stats.processed += 1
                     buffer.append(raw_row)
+                    if _should_emit_count(stats.processed):
+                        _emit_progress(progress_callback, adapter, stats, "reading")
                     if len(buffer) >= enrich_batch_size:
                         process_rows(buffer, cur)
                         buffer = []
@@ -162,6 +221,7 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
 
     stats.finished_at = now_utc_iso()
     stats.duration_seconds = duration_seconds(stats.started_at, stats.finished_at)
+    _emit_progress(progress_callback, adapter, stats, "finished")
     write_stats(
         run_config.stats_path,
         {
